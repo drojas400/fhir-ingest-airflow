@@ -72,10 +72,11 @@ def upsert_raw(cur, resource_type: str, resources: list[dict], run_id: str) -> d
         if prev is None or lu > prev[3]:
             rows[r["id"]] = (resource_type, r["id"], meta.get("versionId"), lu, Json(r), run_id)
     if not rows:
-        return {"inserted": 0, "updated": 0, "unchanged": 0, "skipped": skipped}
+        return {"inserted": 0, "updated": 0, "unchanged": 0, "skipped": skipped, "max_last_updated": None}
     returned = execute_values(cur, RAW_UPSERT, list(rows.values()), fetch=True)
     inserted, updated, unchanged = _count(returned, len(rows))
-    return {"inserted": inserted, "updated": updated, "unchanged": unchanged, "skipped": skipped}
+    return {"inserted": inserted, "updated": updated, "unchanged": unchanged, "skipped": skipped,
+            "max_last_updated": max(v[3] for v in rows.values())}
 
 
 def _upsert_core(cur, table: str, pk: str, cols: list[str], rows: list[dict]) -> tuple[int, int, int]:
@@ -116,3 +117,27 @@ def load_pending_to_core(conn, resource_type: str, batch_size: int = 500) -> dic
                 stats["updated"] += upd
                 stats["unchanged"] += unch
     return stats
+
+
+WATERMARK_UPSERT = """
+INSERT INTO audit.watermark AS w (resource_type, high_watermark, updated_by_run)
+VALUES (%s, %s, %s)
+ON CONFLICT (resource_type) DO UPDATE SET
+    high_watermark = EXCLUDED.high_watermark,
+    updated_at     = now(),
+    updated_by_run = EXCLUDED.updated_by_run
+WHERE EXCLUDED.high_watermark > w.high_watermark
+"""
+
+
+def get_watermark(cur, resource_type: str):
+    """Highest source lastUpdated already landed in raw, or None on first run."""
+    cur.execute("SELECT high_watermark FROM audit.watermark WHERE resource_type = %s",
+                (resource_type,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def advance_watermark(cur, resource_type: str, value, run_id: str) -> None:
+    """Move the watermark forward only (monotonic); never moves it back."""
+    cur.execute(WATERMARK_UPSERT, (resource_type, value, run_id))
